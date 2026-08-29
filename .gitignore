@@ -14,6 +14,7 @@ venv/
 Thumbs.db
 
 # Local test artifacts and generated media
+tests/
 .trim_test/
 trimmed/
 *_trimmed.*
