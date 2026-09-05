@@ -7,6 +7,13 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
+# Local secrets and logs
+.env
+.env.*
+!.env.example
+!.env.sample
+*.log
+
 # Local editor and operating-system files
 .idea/
 .vscode/
