@@ -1,12 +1,12 @@
 # Whisper Trimmer Script Guide
 
-These scripts use Whisper timestamps to identify speech in audio or video, then use FFmpeg to remove the non-speech portions. The original media is not modified unless an existing output is deliberately replaced with the `--overwrite` option supported by the batch Python scripts.
+These scripts use Whisper timestamps to identify speech in audio or video, then use FFmpeg to remove the non-speech portions. Folder modes write separate outputs and skip existing outputs unless `--overwrite` is supplied. Single-file mode in `whisper_trim.py` replaces an existing output by default and rejects using the input file as the output.
 
 ## At a glance
 
 | File | Purpose | Input location | Output location |
 | --- | --- | --- | --- |
-| `whisper_trim.py` | Trims one explicitly named media file | Any path supplied on the command line | Any path supplied on the command line |
+| `whisper_trim.py` | Trims one file or recursively processes a folder, reusing one model per run | A file or folder supplied on the command line | Explicit file path, or `_trimmed` files beside sources / in a supplied output folder |
 | `whisper_trim_all.py` | Trims every supported media file beside the script; fully self-contained | The script's own folder | Beside each original, with `_trimmed` added |
 | `whisper_trim_all_dependant.py` | Trims every supported media file beside the script; reuses `whisper_trim.py` | The script's own folder | Beside each original, with `_trimmed` added |
 | `trim_parent_folder.bat` | Sends every supported media file in the scripts' parent folder through `whisper_trim.py` | The folder one level above the batch file | A `trimmed` subfolder in that parent folder |
@@ -14,12 +14,12 @@ These scripts use Whisper timestamps to identify speech in audio or video, then 
 
 ## `whisper_trim.py`
 
-This is the core single-file trimmer and the shared implementation used by some of the other scripts.
+This is the core trimmer, supporting both single files and recursive folder processing. It also supplies shared functions used by some of the other scripts.
 
 It:
 
 1. Checks the input with `ffprobe` to determine its duration and whether it contains audio and video.
-2. Uses `faster-whisper` when available, falling back to `openai-whisper` when the backend is set to `auto`.
+2. Lazily loads a Whisper model on the first transcription and reuses it for subsequent files in the same folder run. With `--backend auto`, it tries `faster-whisper` and falls back to `openai-whisper` if the first backend cannot be imported or raises a runtime error during loading. Transcription errors are reported for the affected file without switching models.
 3. Collects word timestamps by default, or broader segment timestamps with `--segment-timestamps`.
 4. Discards extremely short detections, adds padding around speech, and joins ranges separated by short pauses.
 5. Uses FFmpeg to extract and concatenate the retained ranges.
@@ -31,7 +31,52 @@ Basic use:
 python whisper_trim.py "input.mp4" "output.mp4"
 ```
 
-It requires both an input and an output path. It can also produce audio-only output, perform a dry run, select the Whisper backend/model/language/device, and adjust detection or encoding settings.
+Single-file mode requires both an input and an output path. It can also produce audio-only output, perform a dry run, select the Whisper backend/model/language/device, and adjust detection or encoding settings.
+
+For recursive folder processing, supply a folder instead of a file:
+
+```powershell
+python whisper_trim.py "D:\Media"
+python whisper_trim.py "D:\Media" "D:\Trimmed Media" --model medium
+```
+
+With no output folder, each output is saved beside its original with `_trimmed`
+added before the extension. With an output folder, the source's relative folder
+structure is preserved: `D:\Media\Day 1\clip.mp4` becomes
+`D:\Trimmed Media\Day 1\clip_trimmed.mp4`.
+
+The recursive scan takes a snapshot before processing and:
+
+- Skips any filename stem ending in `_trimmed`, case-insensitively, so default
+  outputs from this script and the older Python batch scripts are not reprocessed.
+- Excludes the destination folder when it is nested inside the source folder.
+- Skips hidden names, symbolic links, empty files, and unrecognized extensions.
+
+Files generated under other names or older custom output suffixes are not
+automatically identified as outputs. Move those outside the source tree if needed.
+
+Existing destinations are skipped unless `--overwrite` is supplied. All existing
+transcription and encoding options apply to every file. Processing is sequential,
+so a single model is reused without concurrent calls into it; there is no
+`--workers` option. No model is loaded if every file is skipped before transcription.
+
+```powershell
+python whisper_trim.py "D:\Media" --dry-run
+python whisper_trim.py "D:\Media" --overwrite
+```
+
+A dry run prints ranges and creates no output media or destination folders. It
+still skips existing outputs unless combined with `--overwrite`. Files with no
+detected speech are counted as skipped. Other per-file errors are counted as
+failures, and processing continues. The final summary reports completed (or
+previewed), skipped, and failed totals. Exit status is 1 if any file failed,
+otherwise 0, including when no eligible source files are found.
+
+Folder mode retains source extensions; it does not add new encoders. Video is
+encoded once as H.264; audio uses PCM for `.wav`, FLAC for `.flac`, MP3 for `.mp3`,
+and AAC otherwise. Some recognized containers, such as WebM, cannot hold these
+codecs and may fail. For those files, use single-file mode with a compatible
+output extension such as `.mp4` or `.wav`.
 
 ## `whisper_trim_all.py`
 
@@ -69,6 +114,11 @@ python whisper_trim_all_dependant.py
 ```
 
 This version is easier to maintain because shared trimming behavior lives in one place, but it will fail to start if `whisper_trim.py` is absent or cannot be imported. The filename uses the spelling `dependant`; it means this script is dependent on `whisper_trim.py`.
+
+The two older `whisper_trim_all` launchers still scan only their own folder and
+load a model per transcription. Use the core script's folder mode for recursion
+and model reuse; its one-argument `transcribe(args)` interface remains compatible
+with the dependent launcher.
 
 ## `trim_parent_folder.bat`
 

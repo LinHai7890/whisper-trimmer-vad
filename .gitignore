@@ -19,9 +19,14 @@ venv/
 .vscode/
 .DS_Store
 Thumbs.db
+.git-onedrive-placeholder/
+
+# Local project backup
+/Whisper Trimmer old.zip
 
 # Local test artifacts and generated media
 tests/
+/test_whisper_trim.py
 .trim_test/
 trimmed/
 *_trimmed.*
