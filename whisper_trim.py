@@ -228,6 +228,28 @@ def parse_args() -> argparse.Namespace:
         help="Video quality for hardware encoder output. Lower is higher quality.",
     )
     parser.add_argument(
+        "--rate-control",
+        choices=("cq", "vbr", "2pass"),
+        default=None,
+        help="How the encoder spends its bits. cq (the default) targets a "
+        "quality and lets the size fall where it may. vbr spends an average "
+        "bitrate. 2pass does the same over two passes and lands closest to "
+        "the target. Ignored with --encoder copy.",
+    )
+    parser.add_argument(
+        "--bitrate",
+        default=None,
+        help="Target video bitrate, such as 1500k or 2M. Required by --rate-control "
+        "vbr and 2pass.",
+    )
+    parser.add_argument(
+        "--target-size",
+        default=None,
+        help="Target output size, such as 700M. The video bitrate is worked out "
+        "from the audio that is actually kept. Selects --rate-control 2pass "
+        "unless you say otherwise.",
+    )
+    parser.add_argument(
         "--preset",
         default="medium",
         help="Encoder preset for video output. libx264 and libx265 use x264-style "
@@ -310,6 +332,63 @@ def has_stream(probe: dict, codec_type: str) -> bool:
 
 def count_streams(probe: dict, codec_type: str) -> int:
     return sum(1 for stream in probe.get("streams", []) if stream.get("codec_type") == codec_type)
+
+
+SIZE_SUFFIXES = {"k": 1_000, "m": 1_000_000, "g": 1_000_000_000}
+
+
+def parse_scaled_number(text: str, what: str) -> float:
+    """Read a value like 1500k, 2M or 500000, applying the SI suffix.
+
+    FFmpeg reads -b:v 1500k as 1500 kbit/s, so the suffix scales the number as
+    written rather than converting between bytes and bits.
+    """
+    cleaned = str(text).strip().lower()
+    for suffix in ("kbps", "mbps", "gbps", "bps"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)]
+            break
+    cleaned = cleaned.strip()
+    multiplier = 1
+    if cleaned[-1:] in SIZE_SUFFIXES:
+        multiplier = SIZE_SUFFIXES[cleaned[-1]]
+        cleaned = cleaned[:-1].strip()
+    try:
+        value = float(cleaned) * multiplier
+    except ValueError:
+        raise SystemExit(
+            f"Could not read {what} '{text}'. Try a value like 1500k, 2M or 500000."
+        )
+    if value <= 0:
+        raise SystemExit(f"{what.capitalize()} '{text}' has to be greater than zero.")
+    return value
+
+
+def parse_bitrate(text: str) -> int:
+    """Read a bitrate like 1500k or 2M into bits per second."""
+    return int(parse_scaled_number(text, "bitrate"))
+
+
+def parse_size(text: str) -> float:
+    """Read a file size like 700M into bytes."""
+    return parse_scaled_number(text, "size")
+
+
+def bitrate_for_target_size(size_bytes: float, duration: float, audio_bitrate: int) -> int:
+    """Video bitrate that lands the output on a requested file size.
+
+    The audio track already has a fixed rate, so only what is left of the
+    budget goes to video.
+    """
+    if duration <= 0:
+        raise SystemExit("Cannot size an output that holds no audio.")
+    video_budget = size_bytes * 8 - audio_bitrate * duration
+    if video_budget <= 0:
+        raise SystemExit(
+            "The target size is smaller than the audio alone needs. "
+            "Lower --audio-bitrate, or ask for a bigger --target-size."
+        )
+    return int(video_budget / duration)
 
 
 def decode_audio_mono(input_path: Path, stream_index: int):
@@ -825,6 +904,39 @@ def resolve_encoder(requested: str) -> str:
 
 def video_encoder_args(encoder: str, args: argparse.Namespace) -> list[str]:
     quality = getattr(args, "cq", 19)
+    rate_control = getattr(args, "rate_control", None) or "cq"
+    bitrate = getattr(args, "video_bitrate", None)
+
+    if rate_control in ("vbr", "2pass") and bitrate:
+        # Both modes aim at an average bitrate. Two passes measure the material
+        # first, so the average actually lands instead of drifting.
+        buffer_size = bitrate * 2
+        multipass = "fullres" if rate_control == "2pass" else "disabled"
+        common = ["-b:v", str(bitrate), "-bufsize", str(buffer_size)]
+
+        if encoder in ("h264_nvenc", "hevc_nvenc"):
+            return [
+                "-c:v", encoder,
+                "-preset", "p5",
+                "-tune", "hq",
+                "-rc", "vbr_hq",
+                "-multipass", multipass,
+                *common,
+                "-pix_fmt", "yuv420p",
+            ]
+        if encoder == "h264_qsv":
+            return ["-c:v", encoder, *common, "-look_ahead", "0", "-pix_fmt", "yuv420p"]
+        if encoder in ("h264_vaapi", "hevc_vaapi"):
+            return [
+                "-c:v", encoder,
+                "-vaapi_device", "/dev/dri/renderD128",
+                "-rc_mode", "VBR",
+                "-b:v", str(bitrate),
+                "-pix_fmt", "nv12",
+            ]
+        return ["-c:v", encoder, "-preset", getattr(args, "preset", "medium"),
+                *common, "-pix_fmt", "yuv420p"]
+
     if encoder in ("h264_nvenc", "hevc_nvenc"):
         return [
             "-c:v", encoder,
@@ -858,6 +970,12 @@ def video_encoder_args(encoder: str, args: argparse.Namespace) -> list[str]:
         "-crf", str(args.crf),
         "-pix_fmt", "yuv420p",
     ]
+
+
+def passes_needed(args: argparse.Namespace) -> int:
+    if (getattr(args, "rate_control", None) or "cq") != "2pass":
+        return 1
+    return 1 if getattr(args, "encoder", "auto") == "copy" else 2
 
 
 def render_copy(
@@ -957,42 +1075,88 @@ def render_output(
         filter_file.write(filter_graph)
         filter_path = Path(filter_file.name)
 
+    passes = passes_needed(args)
     try:
-        command = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(input_path),
-            "-filter_complex_script",
-            str(filter_path),
-        ]
-        if include_video:
-            command += [
-                "-map",
-                "[outv]",
-                "-map",
-                "[outa]",
-                *video_encoder_args(encoder, args),
-                *audio_codec_args(output_path, args.audio_bitrate),
-                "-movflags",
-                "+faststart",
-            ]
-        else:
-            command += ["-map", "[outa]", *audio_codec_args(output_path, args.audio_bitrate)]
+        with tempfile.TemporaryDirectory() as workspace:
+            pass_log = Path(workspace) / "twopass"
+            for number in range(1, passes + 1):
+                command = [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(input_path),
+                    "-filter_complex_script",
+                    str(filter_path),
+                ]
+                if include_video:
+                    command += ["-map", "[outv]", "-map", "[outa]"]
+                    command += video_encoder_args(encoder, args)
+                    command += audio_codec_args(output_path, args.audio_bitrate)
+                else:
+                    command += ["-map", "[outa]", *audio_codec_args(output_path, args.audio_bitrate)]
 
-        command.append(str(output_path))
-        if include_video:
-            print(f"Rendering trimmed file with FFmpeg ({encoder})...")
-        else:
-            print("Rendering trimmed file with FFmpeg...")
-        subprocess.run(command, check=True)
+                if passes > 1:
+                    # Both passes see the same filtered stream, so pass 2 can
+                    # spend the bits where pass 1 found the hard material.
+                    command += ["-pass", str(number), "-passlogfile", str(pass_log)]
+
+                if number == passes:
+                    command += ["-movflags", "+faststart"]
+                    command.append(str(output_path))
+                else:
+                    command += ["-f", "null", os.devnull]
+
+                if include_video:
+                    label = f"{encoder}, {args.rate_control}" if passes > 1 else encoder
+                    print(f"Rendering trimmed file with FFmpeg ({label}) pass {number}/{passes}...")
+                else:
+                    print("Rendering trimmed file with FFmpeg...")
+                subprocess.run(command, check=True)
     finally:
         filter_path.unlink(missing_ok=True)
 
     return intervals
+
+
+def resolve_rate_control(args: argparse.Namespace, intervals: list[tuple[float, float]]) -> None:
+    """Work out the encoder's rate control before anything is rendered.
+
+    Sets args.rate_control and args.video_bitrate, and prints the bitrate and
+    the size it is aiming at so the numbers can be checked up front.
+    """
+    if args.encoder == "copy":
+        return
+
+    if args.target_size:
+        if args.rate_control is None:
+            print("--target-size asked for, so using --rate-control 2pass to land on it.")
+            args.rate_control = "2pass"
+        kept = sum(end - start for start, end in intervals)
+        size_bytes = parse_size(args.target_size)
+        audio_bitrate = parse_bitrate(args.audio_bitrate)
+        args.video_bitrate = bitrate_for_target_size(size_bytes, kept, audio_bitrate)
+        predicted = (args.video_bitrate + audio_bitrate) * kept / 8
+        # Suffixes are decimal, the same as FFmpeg, so report in decimal too.
+        print(
+            f"Targeting {args.target_size} ({size_bytes / 1_000_000:.0f} MB) over {kept:.0f}s: "
+            f"{args.video_bitrate / 1_000_000:.2f} Mbps video plus "
+            f"{audio_bitrate / 1000:.0f} kbps audio, predicting "
+            f"{predicted / 1_000_000:.0f} MB."
+        )
+    elif args.bitrate:
+        if args.rate_control is None:
+            args.rate_control = "vbr"
+        args.video_bitrate = parse_bitrate(args.bitrate)
+    else:
+        if args.rate_control in ("vbr", "2pass"):
+            raise SystemExit(
+                f"--rate-control {args.rate_control} needs --bitrate or --target-size."
+            )
+        args.rate_control = "cq"
+        args.video_bitrate = None
 
 
 def trim_file(args: argparse.Namespace, transcriber=None) -> bool:
@@ -1047,6 +1211,8 @@ def trim_file(args: argparse.Namespace, transcriber=None) -> bool:
         concat_path, csv_path = write_cut_list(args.list_dir, args.input, relative, intervals)
         print(f"Cut list: {concat_path}")
         print(f"Timecodes: {csv_path}")
+
+    resolve_rate_control(args, intervals)
     if args.dry_run:
         return True
 
@@ -1164,6 +1330,11 @@ def main() -> int:
         raise SystemExit("The --vad-* millisecond options must be non-negative.")
     if min(args.audio_stream, args.video_stream) < 0:
         raise SystemExit("--audio-stream and --video-stream must be non-negative.")
+    if args.encoder != "copy" and args.target_size and args.rate_control == "cq":
+        raise SystemExit(
+            "--target-size cannot hit a size under --rate-control cq. "
+            "Use --rate-control 2pass, or leave --rate-control out."
+        )
 
     if args.input.is_dir():
         if args.output is not None and args.output.exists() and not args.output.is_dir():

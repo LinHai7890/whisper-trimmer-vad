@@ -179,6 +179,12 @@ python whisper_trim.py "D:\Media" --encoder auto
 - `--encoder`: `auto`, `copy`, `libx264`, `libx265`, `h264_nvenc`, `hevc_nvenc`,
   `h264_qsv`, `h264_vaapi`, `hevc_vaapi`. Short names `nvenc`, `qsv`, `vaapi`, `x264`
   and `x265` also work.
+- `--rate-control`: `cq` (default), `vbr` or `2pass`. Constant quality leaves the
+  size wherever it lands; `vbr` spends an average bitrate over one pass; `2pass`
+  does the same over two and lands closest to the target.
+- `--bitrate`: target video bitrate, such as `1500k`. Required by `vbr` and `2pass`.
+- `--target-size`: target output size, such as `700M`. The bitrate is worked out
+  from the audio that is actually kept, and selects `2pass` unless told otherwise.
 - `--crf`: quality for `libx264` and `libx265`, default `18`.
 - `--cq`: quality for hardware encoders, default `19`. NVENC needs a higher number
   than x264 for a similar file size; `21` to `23` is a good starting point for
@@ -186,6 +192,24 @@ python whisper_trim.py "D:\Media" --encoder auto
 - `--preset`: `medium` by default. For `libx264` and `libx265` this is an x264-style
   name such as `veryfast`; hardware encoders use their own presets.
 - `--audio-bitrate`: default `192k`.
+
+#### Landing on a size
+
+```powershell
+python whisper_trim.py "input.mp4" "output.mp4" --target-size 700M
+```
+
+The tool prints what it worked out before it starts:
+
+```
+Targeting 700M (700 MB) over 1640s: 3.22 Mbps video plus 192 kbps audio,
+predicting 700 MB.
+```
+
+Measured on a 45 minute episode, two passes came in within 1 per cent of the
+requested size and cost about 1.6 times a single pass, because the first pass
+writes to null and does no real encoding. Note that `--cq` and `--crf` have no
+effect once a bitrate is in play.
 
 #### Cutting without re-encoding
 

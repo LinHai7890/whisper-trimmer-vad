@@ -8,6 +8,7 @@ import whisper_trim
 from whisper_trim import (
     SileroVadDetector,
     align_to_keyframes,
+    bitrate_for_target_size,
     build_detector,
     build_filter_script,
     build_select_script,
@@ -16,8 +17,12 @@ from whisper_trim import (
     ffprobe,
     media_duration,
     merge_intervals,
+    parse_bitrate,
+    parse_size,
+    passes_needed,
     render_output,
     resolve_encoder,
+    resolve_rate_control,
     select_expression,
     timecode,
     video_encoder_args,
@@ -342,6 +347,10 @@ def render_args(source: Path, output: Path, **overrides) -> argparse.Namespace:
         audio_stream=0,
         video_stream=0,
         encoder="libx264",
+        rate_control="cq",
+        bitrate=None,
+        target_size=None,
+        video_bitrate=None,
         cq=19,
         crf=23,
         preset="veryfast",
@@ -349,6 +358,138 @@ def render_args(source: Path, output: Path, **overrides) -> argparse.Namespace:
     )
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+class TestRateControl:
+    def test_bitrate_suffixes_match_ffmpeg(self):
+        assert parse_bitrate("1500k") == 1_500_000
+        assert parse_bitrate("2M") == 2_000_000
+        assert parse_bitrate("192k") == 192_000
+        assert parse_bitrate("2500000") == 2_500_000
+
+    def test_size_suffixes_are_decimal(self):
+        assert parse_size("700M") == 700_000_000
+        assert parse_size("1.5G") == 1_500_000_000
+        assert parse_size("500000") == 500_000
+
+    def test_unreadable_value_is_an_error(self):
+        with pytest.raises(SystemExit):
+            parse_bitrate("fast")
+
+    def test_target_size_leaves_room_for_audio(self):
+        # 700 MB is 5.6 Gbit; 192 kbps of audio over 1000 seconds takes
+        # 192 Mbit of it, leaving 5.408 Mbps for video.
+        video = bitrate_for_target_size(700_000_000, 1000.0, 192_000)
+        assert abs(video - 5_408_000) < 1_000
+
+    def test_target_size_smaller_than_the_audio_is_an_error(self):
+        with pytest.raises(SystemExit):
+            bitrate_for_target_size(1_000_000, 1000.0, 192_000)
+
+    def test_two_pass_uses_nvenc_vbr_and_a_buffer(self):
+        args = argparse.Namespace(cq=19, crf=18, preset="medium", rate_control="2pass",
+                                  video_bitrate=1_500_000)
+        flags = video_encoder_args("h264_nvenc", args)
+        assert flags[flags.index("-rc") + 1] == "vbr_hq"
+        assert flags[flags.index("-multipass") + 1] == "fullres"
+        assert flags[flags.index("-b:v") + 1] == "1500000"
+        assert flags[flags.index("-bufsize") + 1] == "3000000"
+        assert "-cq" not in flags
+
+    def test_single_pass_vbr_disables_multipass(self):
+        args = argparse.Namespace(cq=19, crf=18, preset="medium", rate_control="vbr",
+                                  video_bitrate=1_500_000)
+        flags = video_encoder_args("h264_nvenc", args)
+        assert flags[flags.index("-multipass") + 1] == "disabled"
+
+    def test_libx264_two_pass_uses_a_bitrate_not_a_crf(self):
+        args = argparse.Namespace(cq=19, crf=18, preset="medium", rate_control="2pass",
+                                  video_bitrate=1_500_000)
+        flags = video_encoder_args("libx264", args)
+        assert flags[flags.index("-b:v") + 1] == "1500000"
+        assert "-crf" not in flags
+
+    def test_quality_mode_is_unchanged_without_a_bitrate(self):
+        args = argparse.Namespace(cq=19, crf=18, preset="medium", rate_control="cq",
+                                  video_bitrate=None)
+        flags = video_encoder_args("h264_nvenc", args)
+        assert flags[flags.index("-cq") + 1] == "19"
+        assert flags[flags.index("-b:v") + 1] == "0"
+
+    def test_two_pass_runs_twice(self):
+        assert passes_needed(argparse.Namespace(rate_control="2pass", encoder="auto")) == 2
+        assert passes_needed(argparse.Namespace(rate_control="vbr", encoder="auto")) == 1
+        assert passes_needed(argparse.Namespace(rate_control="cq", encoder="auto")) == 1
+
+    def test_stream_copy_is_never_two_pass(self):
+        assert passes_needed(argparse.Namespace(rate_control="2pass", encoder="copy")) == 1
+
+
+class TestResolveRateControl:
+    def base(self, **overrides):
+        values = dict(
+            encoder="auto", rate_control=None, bitrate=None, target_size=None,
+            audio_bitrate="192k", video_bitrate=None,
+        )
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_bitrate_alone_selects_single_pass_vbr(self):
+        args = self.base(bitrate="1500k")
+        resolve_rate_control(args, [(0.0, 100.0)])
+        assert args.rate_control == "vbr"
+        assert args.video_bitrate == 1_500_000
+
+    def test_target_size_alone_selects_two_pass(self, capsys):
+        args = self.base(target_size="700M")
+        resolve_rate_control(args, [(0.0, 1000.0)])
+        assert args.rate_control == "2pass"
+        assert args.video_bitrate > 0
+        assert "700M" in capsys.readouterr().out
+
+    def test_no_options_falls_back_to_quality(self):
+        args = self.base()
+        resolve_rate_control(args, [(0.0, 100.0)])
+        assert args.rate_control == "cq"
+        assert args.video_bitrate is None
+
+    def test_bitrate_is_required_for_two_pass(self):
+        with pytest.raises(SystemExit):
+            resolve_rate_control(self.base(rate_control="2pass"), [(0.0, 100.0)])
+
+    def test_stream_copy_ignores_rate_control(self):
+        args = self.base(encoder="copy", bitrate="1500k")
+        resolve_rate_control(args, [(0.0, 100.0)])
+        assert args.rate_control is None
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
+def test_two_pass_render_lands_on_the_target_bitrate(synthetic_clip, tmp_path):
+    """Two passes have to actually spend the bits they were given."""
+    output = tmp_path / "twopass.mkv"
+    args = render_args(
+        synthetic_clip, output,
+        encoder="libx264", rate_control="2pass", video_bitrate=400_000,
+        crf=23, preset="ultrafast",
+    )
+    render_output(
+        input_path=synthetic_clip,
+        output_path=output,
+        intervals=[(1.1, 4.9)],
+        include_video=True,
+        include_audio=True,
+        args=args,
+        duration=6.0,
+    )
+    assert_frame_rate_intact(output)
+
+    # Matroska does not always report a per stream bit rate, so measure it.
+    seconds = video_duration(output)
+    audio = next(s for s in ffprobe(output)["streams"] if s["codec_type"] == "audio")
+    audio_bytes = int(audio.get("bit_rate", 128_000))
+    file_size = output.stat().st_size
+    measured = (file_size * 8 - audio_bytes * seconds) / seconds
+    assert 0.7 * 400_000 < measured < 1.3 * 400_000, f"measured {measured:.0f} bps"
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
