@@ -1121,7 +1121,11 @@ def render_output(
     return intervals
 
 
-def resolve_rate_control(args: argparse.Namespace, intervals: list[tuple[float, float]]) -> None:
+def resolve_rate_control(
+    args: argparse.Namespace,
+    intervals: list[tuple[float, float]],
+    include_video: bool = True,
+) -> None:
     """Work out the encoder's rate control before anything is rendered.
 
     Sets args.rate_control and args.video_bitrate, and prints the bitrate and
@@ -1131,6 +1135,14 @@ def resolve_rate_control(args: argparse.Namespace, intervals: list[tuple[float, 
         return
 
     if args.target_size:
+        if not include_video:
+            print(
+                "This output has no video track, so --target-size cannot be met "
+                "with a bitrate. Use --audio-bitrate to control its size."
+            )
+            args.rate_control = args.rate_control or "cq"
+            args.video_bitrate = None
+            return
         if args.rate_control is None:
             print("--target-size asked for, so using --rate-control 2pass to land on it.")
             args.rate_control = "2pass"
@@ -1212,7 +1224,7 @@ def trim_file(args: argparse.Namespace, transcriber=None) -> bool:
         print(f"Cut list: {concat_path}")
         print(f"Timecodes: {csv_path}")
 
-    resolve_rate_control(args, intervals)
+    resolve_rate_control(args, intervals, include_video)
     if args.dry_run:
         return True
 

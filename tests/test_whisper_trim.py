@@ -462,6 +462,12 @@ class TestResolveRateControl:
         resolve_rate_control(args, [(0.0, 100.0)])
         assert args.rate_control is None
 
+    def test_audio_only_output_says_the_size_cannot_be_met(self, capsys):
+        args = self.base(target_size="700M")
+        resolve_rate_control(args, [(0.0, 1000.0)], include_video=False)
+        assert args.video_bitrate is None
+        assert "no video track" in capsys.readouterr().out
+
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
 def test_two_pass_render_lands_on_the_target_bitrate(synthetic_clip, tmp_path):

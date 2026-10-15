@@ -206,10 +206,10 @@ Targeting 700M (700 MB) over 1640s: 3.22 Mbps video plus 192 kbps audio,
 predicting 700 MB.
 ```
 
-Measured on a 45 minute episode, two passes came in within 1 per cent of the
-requested size and cost about 1.6 times a single pass, because the first pass
-writes to null and does no real encoding. Note that `--cq` and `--crf` have no
-effect once a bitrate is in play.
+Measured on this machine: a five minute clip asked for 45M landed on 44.9M, and a
+45 minute episode asked for 400M landed on 387.4M. Two passes cost about twice a
+single pass, because the first pass writes to null and does no real encoding. Note
+that `--cq` and `--crf` have no effect once a bitrate is in play.
 
 #### Cutting without re-encoding
 

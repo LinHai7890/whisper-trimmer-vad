@@ -37,7 +37,7 @@
 
 .PARAMETER TargetSize
     目标成品体积，如 700M。工具按实际保留时长反算视频码率，并自动切换到
-    两遍编码，实测体积偏差在 1% 以内。
+    两遍编码。实测偏差在 3% 以内，耗时约为单遍的两倍。
 
 .PARAMETER Bitrate
     目标视频码率，如 1500k。配合 -RateControl vbr 使用。
