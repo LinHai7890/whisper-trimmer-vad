@@ -7,12 +7,18 @@ import pytest
 import whisper_trim
 from whisper_trim import (
     SileroVadDetector,
+    align_to_keyframes,
     build_detector,
     build_filter_script,
+    build_select_script,
     detector_padding,
     ffconcat_escape,
+    ffprobe,
+    media_duration,
     merge_intervals,
+    render_output,
     resolve_encoder,
+    select_expression,
     timecode,
     video_encoder_args,
     write_cut_list,
@@ -217,6 +223,171 @@ def duration_of(path: Path) -> float:
         stdout=subprocess.PIPE,
     )
     return float(completed.stdout.decode("utf-8", errors="replace").strip())
+
+
+class TestKeyframeAlignment:
+    KEYFRAMES = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+
+    def test_grows_each_range_outwards(self):
+        aligned = align_to_keyframes([(1.4, 2.6)], self.KEYFRAMES, duration=6.0)
+        assert aligned == [(1.0, 3.0)]
+
+    def test_range_starting_on_a_keyframe_does_not_move(self):
+        assert align_to_keyframes([(2.0, 2.5)], self.KEYFRAMES, duration=6.0) == [(2.0, 3.0)]
+
+    def test_range_after_the_last_keyframe_runs_to_the_end(self):
+        assert align_to_keyframes([(4.2, 5.5)], self.KEYFRAMES, duration=6.0) == [(4.0, 6.0)]
+
+    def test_first_range_snaps_to_the_first_keyframe(self):
+        assert align_to_keyframes([(0.1, 0.4)], self.KEYFRAMES, duration=6.0) == [(0.0, 1.0)]
+
+    def test_overlapping_grown_ranges_are_merged(self):
+        # 1.4-2.0 grows to 1.0-2.0 and 2.2-2.6 grows to 2.0-3.0.
+        aligned = align_to_keyframes([(1.4, 2.0), (2.2, 2.6)], self.KEYFRAMES, duration=6.0)
+        assert aligned == [(1.0, 3.0)]
+
+    def test_no_keyframes_is_an_error(self):
+        with pytest.raises(SystemExit):
+            align_to_keyframes([(1.0, 2.0)], [], duration=6.0)
+
+
+class TestSelectScript:
+    def test_expression_covers_every_range(self):
+        expression = select_expression([(1.0, 2.0), (3.0, 4.5)])
+        assert expression == "between(t,1.000000,2.000000)+between(t,3.000000,4.500000)"
+
+    def test_graph_labels_both_outputs(self):
+        script = build_select_script([(1.0, 2.0)], include_video=True, include_audio=True)
+        assert "[0:v:0]select=" in script
+        assert "setpts=N/FRAME_RATE/TB[outv]" in script
+        assert "[0:a:0]aselect=" in script
+        assert "asetpts=N/SR/TB[outa]" in script
+
+    def test_audio_only_graph_has_no_video_chain(self):
+        script = build_select_script([(1.0, 2.0)], include_video=False, include_audio=True)
+        assert "[0:v:0]" not in script
+        assert "asetpts=N/SR/TB[outa]" in script
+
+    def test_graph_uses_the_requested_tracks(self):
+        script = build_select_script([(1.0, 2.0)], True, True, video_stream=1, audio_stream=2)
+        assert "[0:v:1]select=" in script
+        assert "[0:a:2]aselect=" in script
+
+
+def video_frame_count(path: Path) -> int:
+    completed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+            "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(path),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    return int(completed.stdout.decode("utf-8", errors="replace").strip())
+
+
+def video_duration(path: Path) -> float:
+    """Duration of the video stream alone; the container also holds audio."""
+    for stream in ffprobe(path)["streams"]:
+        if stream.get("codec_type") == "video" and stream.get("duration"):
+            return float(stream["duration"])
+    return media_duration(ffprobe(path))
+
+
+def assert_frame_rate_intact(path: Path, rate: float = 25.0) -> None:
+    """Every frame has to be a real frame, at the source rate.
+
+    A cut that starts mid GOP leaves the decoder unable to emit new pictures
+    until the next IDR, so it repeats stale frames instead. That shows up as
+    far more frames than the duration can hold, and as a stalled picture: the
+    clip measured 41.8fps against a 30fps source before the ranges were grown
+    to key frames.
+
+    Two per cent of slack absorbs the frame or two each cut boundary picks up
+    from inclusive in and out points, and still leaves plenty of room between
+    that and the 39 per cent a stalled cut adds.
+    """
+    frames = video_frame_count(path)
+    seconds = video_duration(path)
+    expected = seconds * rate
+    assert abs(frames - expected) <= max(2, expected * 0.02), (
+        f"{frames} frames in {seconds:.3f}s is {frames / seconds:.2f}fps, "
+        f"expected {rate}fps ({expected:.1f} frames)"
+    )
+
+
+@pytest.fixture(scope="module")
+def synthetic_clip(tmp_path_factory):
+    """Six seconds of 25fps video with a key frame every second."""
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg is required")
+    source = tmp_path_factory.mktemp("media") / "clip.mkv"
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=6",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+            "-c:v", "libx264", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(source),
+        ],
+        check=True,
+    )
+    return source
+
+
+def render_args(source: Path, output: Path, **overrides) -> argparse.Namespace:
+    values = dict(
+        input=source,
+        output=output,
+        audio_stream=0,
+        video_stream=0,
+        encoder="libx264",
+        cq=19,
+        crf=23,
+        preset="veryfast",
+        audio_bitrate="128k",
+    )
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
+def test_rendering_keeps_the_frame_rate(synthetic_clip, tmp_path):
+    """The rendered cut must hold exactly the frames the range asked for.
+
+    A copied cut that starts mid GOP leaves the decoder unable to produce new
+    frames, which shows up as duplicated frames and a stalled picture.
+    """
+    output = tmp_path / "out.mp4"
+    render_output(
+        input_path=synthetic_clip,
+        output_path=output,
+        intervals=[(1.1, 2.9)],
+        include_video=True,
+        include_audio=True,
+        args=render_args(synthetic_clip, output),
+        duration=6.0,
+    )
+    # 1.1s to 2.9s at 25fps is 45 frames.
+    assert abs(video_frame_count(output) - 45) <= 1
+    assert_frame_rate_intact(output)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
+def test_stream_copy_keeps_the_frame_rate(synthetic_clip, tmp_path):
+    output = tmp_path / "copied.mp4"
+    aligned = render_output(
+        input_path=synthetic_clip,
+        output_path=output,
+        intervals=[(1.1, 2.9)],
+        include_video=True,
+        include_audio=True,
+        args=render_args(synthetic_clip, output, encoder="copy"),
+        duration=6.0,
+    )
+    # Grown to 1.0s to 3.0s, which is two whole seconds at 25fps.
+    assert aligned == [(1.0, 3.0)]
+    assert_frame_rate_intact(output)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")

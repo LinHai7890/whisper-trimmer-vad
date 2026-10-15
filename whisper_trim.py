@@ -5,6 +5,12 @@ Remove non-speech sections from a media file or recursive folder of media.
 The script finds spoken ranges, expands each range by a small padding, merges
 nearby ranges, and asks FFmpeg to render only those ranges.
 
+The ranges are applied in a single pass, by selecting the frames and samples
+whose timestamps fall inside them, which keeps the cost flat as the number of
+ranges grows. On an episode that turns into three hundred of them, the older
+trim and concat approach needed one filter branch per range and slowed down
+sharply.
+
 Two detectors are available. Silero VAD is the default: it is a voice activity
 model, so it keeps shouting, singing and overlapping dialogue that a speech
 recognizer drops, and it never invents speech over music or noise. Whisper is
@@ -15,6 +21,7 @@ refinement.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import os
 import shutil
@@ -29,6 +36,9 @@ VAD_SAMPLE_RATE = 16000
 
 # Hardware encoders are tried in this order when --encoder auto is used.
 ENCODER_PREFERENCE = ("h264_nvenc", "hevc_nvenc", "h264_qsv", "h264_vaapi", "libx264")
+# Past this many characters the select expression gets unwieldy and the trim and
+# concat graph is used instead.
+SELECT_EXPRESSION_LIMIT = 60_000
 ENCODER_CHOICES = (
     "auto",
     "copy",
@@ -579,6 +589,77 @@ def ffconcat_escape(path: Path) -> str:
     return str(path).replace("\\", "/").replace("'", r"'\''")
 
 
+def video_keyframes(input_path: Path, stream_index: int) -> list[float]:
+    """Timestamps of every key frame in a video track.
+
+    Read from packet flags rather than by decoding, which keeps this cheap on
+    a feature length file.
+    """
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            f"v:{stream_index}",
+            "-show_entries",
+            "packet=pts_time,flags",
+            "-of",
+            "csv=p=0",
+            str(input_path),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    timestamps: list[float] = []
+    for line in completed.stdout.decode("utf-8", errors="replace").splitlines():
+        columns = line.split(",")
+        if len(columns) < 2 or "K" not in columns[1]:
+            continue
+        try:
+            timestamps.append(float(columns[0]))
+        except ValueError:
+            continue
+    return sorted(set(timestamps))
+
+
+def align_to_keyframes(
+    intervals: list[tuple[float, float]],
+    keyframes: list[float],
+    duration: float,
+) -> list[tuple[float, float]]:
+    """Grow each range outwards to whole key frames.
+
+    A copied H.264 range is only decodable when it starts on an IDR, so every
+    range has to begin at a key frame and end where the next one begins.
+    Anything in between is kept even when it holds no speech, which is the
+    price of not re-encoding.
+    """
+    if not keyframes:
+        raise SystemExit(
+            "Could not find any key frames to align to. "
+            "Re-encode instead of using --encoder copy."
+        )
+
+    aligned: list[tuple[float, float]] = []
+    for start, end in intervals:
+        start_index = bisect.bisect_right(keyframes, start + 1e-3) - 1
+        if start_index < 0:
+            start_index = 0
+        aligned_start = keyframes[start_index]
+
+        end_index = bisect.bisect_left(keyframes, end - 1e-3)
+        if end_index >= len(keyframes):
+            aligned_end = duration
+        else:
+            aligned_end = keyframes[end_index]
+
+        if aligned_end > aligned_start:
+            aligned.append((aligned_start, aligned_end))
+
+    return merge_intervals(aligned, duration=duration, padding=0.0, merge_gap=0.0, min_duration=0.0)
+
+
 def build_ffconcat(input_path: Path, intervals: list[tuple[float, float]]) -> str:
     lines = ["ffconcat version 1.0"]
     for start, end in intervals:
@@ -610,6 +691,37 @@ def write_cut_list(
         )
     csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
     return concat_path, csv_path
+
+
+def select_expression(intervals: list[tuple[float, float]]) -> str:
+    return "+".join(f"between(t,{start:.6f},{end:.6f})" for start, end in intervals)
+
+
+def build_select_script(
+    intervals: list[tuple[float, float]],
+    include_video: bool,
+    include_audio: bool,
+    video_stream: int = 0,
+    audio_stream: int = 0,
+) -> str:
+    """Keep the frames and samples that fall inside the ranges, in one pass.
+
+    Selecting against a timestamp expression decodes the source once and leaves
+    the timeline compressed, which stays fast when there are hundreds of
+    ranges. The trim and concat equivalent needs one filter branch per range
+    and slows down sharply as they pile up.
+    """
+    expression = select_expression(intervals)
+    chains: list[str] = []
+
+    if include_video:
+        chains.append(
+            f"[0:v:{video_stream}]select='{expression}',setpts=N/FRAME_RATE/TB[outv]"
+        )
+    if include_audio:
+        chains.append(f"[0:a:{audio_stream}]aselect='{expression}',asetpts=N/SR/TB[outa]")
+
+    return ";\n".join(chains) + ";\n"
 
 
 def build_filter_script(
@@ -746,16 +858,30 @@ def render_copy(
     input_path: Path,
     output_path: Path,
     intervals: list[tuple[float, float]],
-) -> None:
-    """Cut without re-encoding, by handing the ranges to the concat demuxer.
+    duration: float,
+    video_stream: int = 0,
+) -> list[tuple[float, float]]:
+    """Cut without re-encoding, after growing each range to whole key frames.
 
-    Far faster than re-encoding and lossless, but every range snaps to a key
-    frame, so cut points land up to one GOP early and the audio and video
-    together are not frame accurate.
+    Far faster than re-encoding and lossless, but a copied H.264 range is only
+    decodable when it starts on an IDR, so every range is widened to the key
+    frame before it and the key frame after it. Whatever sits in between is
+    kept even when it holds no speech.
     """
+    keyframes = video_keyframes(input_path, video_stream)
+    aligned = align_to_keyframes(intervals, keyframes, duration)
+
+    kept = sum(end - start for start, end in aligned)
+    print(
+        f"Aligned {len(intervals)} range(s) to {len(keyframes)} key frame(s): "
+        f"{kept:.2f}s kept instead of "
+        f"{sum(end - start for start, end in intervals):.2f}s "
+        f"(+{kept - sum(end - start for start, end in intervals):.2f}s that holds no speech)."
+    )
+
     with tempfile.TemporaryDirectory() as workspace:
         list_path = Path(workspace) / "cut.ffconcat"
-        list_path.write_text(build_ffconcat(input_path, intervals), encoding="utf-8")
+        list_path.write_text(build_ffconcat(input_path, aligned), encoding="utf-8")
         print("Rendering trimmed file with FFmpeg (stream copy)...")
         subprocess.run(
             [
@@ -776,6 +902,7 @@ def render_copy(
             ],
             check=True,
         )
+    return aligned
 
 
 def render_output(
@@ -785,14 +912,17 @@ def render_output(
     include_video: bool,
     include_audio: bool,
     args: argparse.Namespace,
-) -> None:
+    duration: float | None = None,
+) -> list[tuple[float, float]]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     encoder = resolve_encoder(getattr(args, "encoder", "auto"))
-    if encoder == "copy" and include_video:
-        render_copy(input_path, output_path, intervals)
-        return
     if encoder == "copy":
+        if include_video and duration is not None:
+            return render_copy(
+                input_path, output_path, intervals, duration,
+                getattr(args, "video_stream", 0),
+            )
         # Stream copy cannot transcode, and an audio-only output still needs the
         # speech ranges applied as filters.
         print("Audio-only output cannot be stream copied; re-encoding instead.")
@@ -800,12 +930,25 @@ def render_output(
 
     video_stream = getattr(args, "video_stream", 0)
     audio_stream = getattr(args, "audio_stream", 0)
-    with tempfile.NamedTemporaryFile("w", suffix=".ffmpeg", delete=False) as filter_file:
-        filter_file.write(
-            build_filter_script(
-                intervals, include_video, include_audio, video_stream, audio_stream
-            )
+
+    # Prefer the single pass select graph. It stays fast with hundreds of
+    # ranges, where one trim branch per range does not.
+    expression_length = len(select_expression(intervals))
+    if expression_length <= SELECT_EXPRESSION_LIMIT:
+        filter_graph = build_select_script(
+            intervals, include_video, include_audio, video_stream, audio_stream
         )
+    else:
+        print(
+            f"{expression_length} expression characters is past the "
+            f"{SELECT_EXPRESSION_LIMIT} limit; falling back to trim and concat."
+        )
+        filter_graph = build_filter_script(
+            intervals, include_video, include_audio, video_stream, audio_stream
+        )
+
+    with tempfile.NamedTemporaryFile("w", suffix=".ffmpeg", delete=False) as filter_file:
+        filter_file.write(filter_graph)
         filter_path = Path(filter_file.name)
 
     try:
@@ -842,6 +985,8 @@ def render_output(
         subprocess.run(command, check=True)
     finally:
         filter_path.unlink(missing_ok=True)
+
+    return intervals
 
 
 def trim_file(args: argparse.Namespace, transcriber=None) -> bool:
@@ -899,14 +1044,28 @@ def trim_file(args: argparse.Namespace, transcriber=None) -> bool:
     if args.dry_run:
         return True
 
-    render_output(
+    rendered = render_output(
         input_path=args.input,
         output_path=args.output,
         intervals=intervals,
         include_video=include_video,
         include_audio=True,
         args=args,
+        duration=duration,
     )
+
+    # Stream copying widens every range to a key frame, so the cut list is
+    # written afterwards to record what was actually rendered.
+    if args.list_dir is not None and rendered != intervals:
+        source_root = getattr(args, "source_root", None)
+        if source_root is not None:
+            relative = args.input.relative_to(source_root)
+        else:
+            relative = Path(args.input.name)
+        concat_path, csv_path = write_cut_list(args.list_dir, args.input, relative, rendered)
+        print(f"Cut list: {concat_path}")
+        print(f"Timecodes: {csv_path}")
+
     print(f"Done: {args.output}")
     return True
 

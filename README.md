@@ -15,6 +15,11 @@ to produce text, not to report whether a voice is present, so it tends to miss
 shouted or overlapping lines and to hallucinate words over music, ambience and sound
 effects.
 
+The detected ranges are applied by selecting the frames and samples whose timestamps
+fall inside them, which decodes the source once and leaves the timeline compressed.
+That matters on dialogue-dense material, where a 45 minute episode produces a few
+hundred ranges, and the cost of rendering stays flat as they pile up.
+
 ## Setup
 
 1. Install FFmpeg and make sure `ffmpeg` and `ffprobe` are available in your terminal.
@@ -177,17 +182,22 @@ python whisper_trim.py "D:\Media" --encoder auto
 #### Cutting without re-encoding
 
 `--encoder copy` hands the ranges to FFmpeg's concat demuxer instead of re-encoding.
-On a five minute test clip it took 0.9 seconds against 18.7 seconds for NVENC, and
-nothing is lost, because no frame is decoded and encoded again.
+Nothing is decoded and encoded again, so nothing is lost, and it is much faster:
+about three seconds for a forty five minute episode against several minutes to
+re-encode it.
 
 ```powershell
 python whisper_trim.py "D:\Media" --encoder copy
 ```
 
-The trade-off is accuracy: every range snaps to the nearest key frame before it, so a
-cut can start up to one GOP early, the output is slightly longer than the re-encoded
-one, and audio and video are not frame accurate against each other. Re-encode when
-the cuts have to land exactly, stream copy when you want the result quickly.
+A copied H.264 range is only decodable when it starts on an IDR, so every range is
+first grown outwards to the key frame before it and the key frame after it. The
+consequence is that anything in between is kept even when it holds no speech. On a
+45 minute episode with an average five second GOP that added 24 per cent of audio
+that the detector had thrown away, and the tool prints how much before it starts.
+
+If that trade is not worth it, use the default. The output is re-encoded, every cut
+lands on the frame you asked for, and nothing but speech is kept.
 
 The output container has to be able to hold the source codecs. Copying H.264 and AAC
 into `.mp4` or `.mkv` is fine. Audio-only output is always re-encoded, because stream
