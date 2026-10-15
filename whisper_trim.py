@@ -2,8 +2,14 @@
 """
 Remove non-speech sections from a media file or recursive folder of media.
 
-The script detects spoken ranges with Whisper, expands each range by a small
-padding, merges nearby ranges, and asks FFmpeg to render only those ranges.
+The script finds spoken ranges, expands each range by a small padding, merges
+nearby ranges, and asks FFmpeg to render only those ranges.
+
+Two detectors are available. Silero VAD is the default: it is a voice activity
+model, so it keeps shouting, singing and overlapping dialogue that a speech
+recognizer drops, and it never invents speech over music or noise. Whisper is
+still available with ``--detector whisper`` when you also want transcript-based
+refinement.
 """
 
 from __future__ import annotations
@@ -17,6 +23,29 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Iterable
+
+# Silero VAD only runs on this sample rate.
+VAD_SAMPLE_RATE = 16000
+
+# Hardware encoders are tried in this order when --encoder auto is used.
+ENCODER_PREFERENCE = ("h264_nvenc", "hevc_nvenc", "h264_qsv", "h264_vaapi", "libx264")
+ENCODER_CHOICES = (
+    "auto",
+    "libx264",
+    "libx265",
+    "h264_nvenc",
+    "hevc_nvenc",
+    "h264_qsv",
+    "h264_vaapi",
+    "hevc_vaapi",
+)
+ENCODER_ALIASES = {
+    "x264": "libx264",
+    "x265": "libx265",
+    "nvenc": "h264_nvenc",
+    "qsv": "h264_qsv",
+    "vaapi": "h264_vaapi",
+}
 
 
 VIDEO_EXTENSIONS = {
@@ -56,15 +85,25 @@ def parse_args() -> argparse.Namespace:
         help="Replace existing outputs in folder mode (otherwise they are skipped).",
     )
     parser.add_argument(
+        "--detector",
+        choices=("vad", "whisper"),
+        default="vad",
+        help="How speech ranges are found. vad uses Silero voice activity "
+        "detection and is the default; whisper uses speech recognition "
+        "timestamps",
+    )
+    parser.add_argument(
         "--model",
         default="small",
-        help="Whisper model name, such as tiny, base, small, medium, or large-v3",
+        help="Whisper model name, such as tiny, base, small, medium, or large-v3. "
+        "Only used with --detector whisper",
     )
     parser.add_argument(
         "--backend",
         choices=("auto", "faster-whisper", "openai-whisper"),
         default="auto",
-        help="Whisper package to use. auto tries faster-whisper first.",
+        help="Whisper package to use. auto tries faster-whisper first. "
+        "Only used with --detector whisper",
     )
     parser.add_argument(
         "--language",
@@ -91,19 +130,47 @@ def parse_args() -> argparse.Namespace:
         "--padding",
         type=float,
         default=0.25,
-        help="Seconds to keep before and after detected speech.",
+        help="Seconds to keep before and after detected speech. "
+        "Only used with --detector whisper; the VAD detector uses --vad-pad-ms.",
     )
     parser.add_argument(
         "--merge-gap",
         type=float,
         default=0.45,
-        help="Merge speech ranges separated by this many seconds or less.",
+        help="Merge speech ranges separated by this many seconds or less. "
+        "Only used with --detector whisper; the VAD detector uses --vad-min-silence-ms.",
     )
     parser.add_argument(
         "--min-duration",
         type=float,
         default=0.08,
-        help="Discard detected speech ranges shorter than this many seconds before padding.",
+        help="Discard detected speech ranges shorter than this many seconds before padding. "
+        "Only used with --detector whisper; the VAD detector uses --vad-min-speech-ms.",
+    )
+    parser.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=0.5,
+        help="Silero VAD speech probability threshold from 0 to 1. Lower keeps "
+        "quieter speech; raise it to stop music and noise from being kept.",
+    )
+    parser.add_argument(
+        "--vad-pad-ms",
+        type=int,
+        default=200,
+        help="Milliseconds of audio to keep before and after each VAD range.",
+    )
+    parser.add_argument(
+        "--vad-min-speech-ms",
+        type=int,
+        default=250,
+        help="Discard VAD ranges shorter than this many milliseconds.",
+    )
+    parser.add_argument(
+        "--vad-min-silence-ms",
+        type=int,
+        default=350,
+        help="Join VAD ranges separated by this many milliseconds of silence or less.",
     )
     parser.add_argument(
         "--segment-timestamps",
@@ -116,20 +183,54 @@ def parse_args() -> argparse.Namespace:
         help="Use faster-whisper's VAD filter when the faster-whisper backend is active.",
     )
     parser.add_argument(
+        "--audio-stream",
+        type=int,
+        default=0,
+        help="Which audio track to detect speech on and to keep, counting from 0.",
+    )
+    parser.add_argument(
+        "--video-stream",
+        type=int,
+        default=0,
+        help="Which video track to keep, counting from 0.",
+    )
+    parser.add_argument(
+        "--encoder",
+        default="auto",
+        help="Video encoder for the output. auto picks a hardware encoder when "
+        "FFmpeg has one, and falls back to libx264. Otherwise use one of: "
+        + ", ".join(ENCODER_CHOICES),
+    )
+    parser.add_argument(
         "--crf",
         type=int,
         default=18,
-        help="Video quality for H.264 output. Lower is higher quality.",
+        help="Video quality for libx264 and libx265 output. Lower is higher quality.",
+    )
+    parser.add_argument(
+        "--cq",
+        type=int,
+        default=19,
+        help="Video quality for hardware encoder output. Lower is higher quality.",
     )
     parser.add_argument(
         "--preset",
         default="medium",
-        help="H.264 encoder preset for video output.",
+        help="Encoder preset for video output. libx264 and libx265 use x264-style "
+        "names such as veryfast or medium; hardware encoders use their own.",
     )
     parser.add_argument(
         "--audio-bitrate",
         default="192k",
         help="Audio bitrate for compressed audio/video outputs.",
+    )
+    parser.add_argument(
+        "--list-dir",
+        type=Path,
+        default=None,
+        help="Also write the cut list for every source here: an .ffconcat file "
+        "that FFmpeg and editors can open, plus a .csv with the original "
+        "timecodes of each kept range.",
     )
     parser.add_argument(
         "--dry-run",
@@ -152,9 +253,10 @@ def run_json(command: list[str]) -> dict:
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
     )
-    return json.loads(completed.stdout)
+    # FFmpeg writes UTF-8 regardless of the console code page, so decoding it
+    # with the locale encoding breaks on non-ASCII file names.
+    return json.loads(completed.stdout.decode("utf-8", errors="replace"))
 
 
 def ffprobe(input_path: Path) -> dict:
@@ -190,6 +292,93 @@ def media_duration(probe: dict) -> float:
 
 def has_stream(probe: dict, codec_type: str) -> bool:
     return any(stream.get("codec_type") == codec_type for stream in probe.get("streams", []))
+
+
+def count_streams(probe: dict, codec_type: str) -> int:
+    return sum(1 for stream in probe.get("streams", []) if stream.get("codec_type") == codec_type)
+
+
+def decode_audio_mono(input_path: Path, stream_index: int):
+    """Decode one audio track to mono float32 at the rate Silero expects."""
+    import numpy as np
+
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(input_path),
+            "-map",
+            f"0:a:{stream_index}",
+            "-ac",
+            "1",
+            "-ar",
+            str(VAD_SAMPLE_RATE),
+            "-f",
+            "f32le",
+            "-",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return np.frombuffer(completed.stdout, dtype=np.float32).copy()
+
+
+class SileroVadDetector:
+    """Find voice activity with Silero, without transcribing any of it.
+
+    Unlike a speech recognizer this keeps shouting, singing and overlapping
+    dialogue, and it never invents speech over music, ambience or effects.
+    """
+
+    def __init__(self) -> None:
+        self.model = None
+        self.torch = None
+        self.load_error = None
+
+    def __call__(self, args: argparse.Namespace) -> list[tuple[float, float]]:
+        if self.load_error is not None:
+            raise RuntimeError(self.load_error)
+        if self.model is None:
+            self._load()
+
+        audio = decode_audio_mono(args.input, args.audio_stream)
+        if audio.size == 0:
+            return []
+        print(
+            f"Scanning {audio.size / VAD_SAMPLE_RATE:.1f}s of audio with Silero VAD "
+            f"(threshold {args.vad_threshold})..."
+        )
+        from silero_vad import get_speech_timestamps
+
+        timestamps = get_speech_timestamps(
+            self.torch.from_numpy(audio),
+            self.model,
+            threshold=args.vad_threshold,
+            min_speech_duration_ms=args.vad_min_speech_ms,
+            min_silence_duration_ms=args.vad_min_silence_ms,
+            speech_pad_ms=args.vad_pad_ms,
+            return_seconds=True,
+        )
+        return [(float(stamp["start"]), float(stamp["end"])) for stamp in timestamps]
+
+    def _load(self) -> None:
+        try:
+            import torch
+            from silero_vad import load_silero_vad
+
+            self.torch = torch
+            self.model = load_silero_vad()
+        except Exception as exc:
+            self.load_error = (
+                f"Could not load Silero VAD: {exc}. "
+                "Install it with: pip install silero-vad"
+            )
+            raise RuntimeError(self.load_error) from exc
+        print("Loaded Silero VAD model.")
 
 
 def load_faster_whisper(args: argparse.Namespace):
@@ -302,12 +491,30 @@ class WhisperTranscriber:
         self.backend = "openai-whisper"
 
 
+def build_detector(args: argparse.Namespace):
+    """Return the detector named by --detector. Both are called as detector(args)."""
+    if getattr(args, "detector", "vad") == "whisper":
+        return WhisperTranscriber()
+    return SileroVadDetector()
+
+
+def detector_padding(args: argparse.Namespace) -> tuple[float, float, float]:
+    """Padding, merge gap and minimum length for the configured detector.
+
+    Silero already applies its own padding and gap merging, so the VAD detector
+    only passes zero here, which turns merge_intervals into a sort and clamp.
+    """
+    if getattr(args, "detector", "vad") == "vad":
+        return 0.0, 0.0, 0.0
+    return args.padding, args.merge_gap, args.min_duration
+
+
 def transcribe(
-    args: argparse.Namespace, transcriber: WhisperTranscriber | None = None,
+    args: argparse.Namespace, transcriber=None,
 ) -> list[tuple[float, float]]:
     # Keep transcribe(args) available to whisper_trim_all_dependant.py.
     if transcriber is None:
-        transcriber = WhisperTranscriber()
+        transcriber = build_detector(args)
     return transcriber(args)
 
 
@@ -353,10 +560,60 @@ def label(prefix: str, index: int) -> str:
     return f"{prefix}{index}"
 
 
+def timecode(seconds: float) -> str:
+    milliseconds = int(round(seconds * 1000))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def ffconcat_escape(path: Path) -> str:
+    """Escape a path for the FFmpeg concat demuxer, including Windows drives."""
+    # Normalise separators first, otherwise the backslash that protects the
+    # drive colon would be turned into a slash again.
+    text = str(path).replace("\\", "/")
+    text = text.replace("'", r"'\''")
+    if len(text) > 1 and text[1] == ":":
+        text = text[:2].replace(":", r"\:") + text[2:]
+    return text
+
+
+def write_cut_list(
+    list_dir: Path,
+    input_path: Path,
+    relative: Path,
+    intervals: list[tuple[float, float]],
+) -> tuple[Path, Path]:
+    """Write an .ffconcat cut list and a .csv of the original timecodes."""
+    destination = list_dir / relative.with_suffix("")
+    concat_path = destination.with_suffix(".ffconcat")
+    csv_path = destination.with_suffix(".csv")
+    concat_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = ["ffconcat version 1.0"]
+    for start, end in intervals:
+        lines.append(f"file '{ffconcat_escape(input_path)}'")
+        lines.append(f"inpoint {start:.6f}")
+        lines.append(f"outpoint {end:.6f}")
+    concat_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    rows = ["index,start_seconds,end_seconds,duration_seconds,start_timecode,end_timecode"]
+    for index, (start, end) in enumerate(intervals, 1):
+        rows.append(
+            f"{index},{start:.3f},{end:.3f},{end - start:.3f},"
+            f"{timecode(start)},{timecode(end)}"
+        )
+    csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return concat_path, csv_path
+
+
 def build_filter_script(
     intervals: list[tuple[float, float]],
     include_video: bool,
     include_audio: bool,
+    video_stream: int = 0,
+    audio_stream: int = 0,
 ) -> str:
     lines: list[str] = []
     concat_inputs: list[str] = []
@@ -365,14 +622,14 @@ def build_filter_script(
         if include_video:
             v_label = label("v", index)
             lines.append(
-                f"[0:v:0]trim=start={start:.6f}:end={end:.6f},"
+                f"[0:v:{video_stream}]trim=start={start:.6f}:end={end:.6f},"
                 f"setpts=PTS-STARTPTS[{v_label}];"
             )
             concat_inputs.append(f"[{v_label}]")
         if include_audio:
             a_label = label("a", index)
             lines.append(
-                f"[0:a:0]atrim=start={start:.6f}:end={end:.6f},"
+                f"[0:a:{audio_stream}]atrim=start={start:.6f}:end={end:.6f},"
                 f"asetpts=PTS-STARTPTS[{a_label}];"
             )
             concat_inputs.append(f"[{a_label}]")
@@ -398,6 +655,86 @@ def audio_codec_args(output_path: Path, bitrate: str) -> list[str]:
     return ["-c:a", "aac", "-b:a", bitrate]
 
 
+_available_encoders: set[str] | None = None
+
+
+def available_encoders() -> set[str]:
+    """Encoder names this FFmpeg build supports, probed once per run."""
+    global _available_encoders
+    if _available_encoders is None:
+        completed = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        text = completed.stdout.decode("utf-8", errors="replace")
+        names: set[str] = set()
+        for line in text.splitlines():
+            columns = line.split()
+            # Video encoder lines look like " V....D h264_nvenc   NVIDIA ...".
+            if len(columns) >= 2 and columns[0].startswith("V") and len(columns[0]) > 1:
+                names.add(columns[1])
+        _available_encoders = names
+    return _available_encoders
+
+
+def resolve_encoder(requested: str) -> str:
+    if requested != "auto":
+        name = ENCODER_ALIASES.get(requested, requested)
+        if name not in ENCODER_CHOICES or name == "auto":
+            raise SystemExit(f"Unknown encoder '{requested}'. Choose one of: {', '.join(ENCODER_CHOICES)}")
+        if name not in available_encoders():
+            raise SystemExit(
+                f"This FFmpeg build has no '{name}' encoder. "
+                "Use --encoder auto to pick one automatically."
+            )
+        return name
+
+    supported = available_encoders()
+    for encoder in ENCODER_PREFERENCE:
+        if encoder in supported:
+            return encoder
+    return "libx264"
+
+
+def video_encoder_args(encoder: str, args: argparse.Namespace) -> list[str]:
+    quality = getattr(args, "cq", 19)
+    if encoder in ("h264_nvenc", "hevc_nvenc"):
+        return [
+            "-c:v", encoder,
+            "-preset", "p5",
+            "-tune", "hq",
+            "-rc", "vbr",
+            "-cq", str(quality),
+            "-b:v", "0",
+            "-pix_fmt", "yuv420p",
+        ]
+    if encoder == "h264_qsv":
+        return [
+            "-c:v", encoder,
+            "-preset", getattr(args, "preset", "medium"),
+            "-global_quality", str(quality),
+            "-look_ahead", "0",
+            "-pix_fmt", "yuv420p",
+        ]
+    if encoder in ("h264_vaapi", "hevc_vaapi"):
+        return [
+            "-c:v", encoder,
+            "-vaapi_device", "/dev/dri/renderD128",
+            "-rc_mode", "CQP",
+            "-qp", str(quality),
+            "-pix_fmt", "nv12",
+        ]
+    # libx264 and libx265.
+    return [
+        "-c:v", encoder,
+        "-preset", getattr(args, "preset", "medium"),
+        "-crf", str(args.crf),
+        "-pix_fmt", "yuv420p",
+    ]
+
+
 def render_output(
     input_path: Path,
     output_path: Path,
@@ -408,9 +745,17 @@ def render_output(
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    video_stream = getattr(args, "video_stream", 0)
+    audio_stream = getattr(args, "audio_stream", 0)
     with tempfile.NamedTemporaryFile("w", suffix=".ffmpeg", delete=False) as filter_file:
-        filter_file.write(build_filter_script(intervals, include_video, include_audio))
+        filter_file.write(
+            build_filter_script(
+                intervals, include_video, include_audio, video_stream, audio_stream
+            )
+        )
         filter_path = Path(filter_file.name)
+
+    encoder = resolve_encoder(getattr(args, "encoder", "auto")) if include_video else None
 
     try:
         command = [
@@ -430,14 +775,7 @@ def render_output(
                 "[outv]",
                 "-map",
                 "[outa]",
-                "-c:v",
-                "libx264",
-                "-preset",
-                args.preset,
-                "-crf",
-                str(args.crf),
-                "-pix_fmt",
-                "yuv420p",
+                *video_encoder_args(encoder, args),
                 *audio_codec_args(output_path, args.audio_bitrate),
                 "-movflags",
                 "+faststart",
@@ -446,13 +784,16 @@ def render_output(
             command += ["-map", "[outa]", *audio_codec_args(output_path, args.audio_bitrate)]
 
         command.append(str(output_path))
-        print("Rendering trimmed file with FFmpeg...")
+        if include_video:
+            print(f"Rendering trimmed file with FFmpeg ({encoder})...")
+        else:
+            print("Rendering trimmed file with FFmpeg...")
         subprocess.run(command, check=True)
     finally:
         filter_path.unlink(missing_ok=True)
 
 
-def trim_file(args: argparse.Namespace, transcriber: WhisperTranscriber) -> bool:
+def trim_file(args: argparse.Namespace, transcriber=None) -> bool:
     """Return False when there is no speech; otherwise render or preview."""
     probe = ffprobe(args.input)
     duration = media_duration(probe)
@@ -466,13 +807,26 @@ def trim_file(args: argparse.Namespace, transcriber: WhisperTranscriber) -> bool
     if output_wants_video and not input_has_video:
         raise SystemExit("The output extension looks like video, but the input has no video stream.")
 
+    audio_total = count_streams(probe, "audio")
+    if args.audio_stream >= audio_total:
+        raise SystemExit(
+            f"--audio-stream {args.audio_stream} was requested but the input has "
+            f"{audio_total} audio track(s)."
+        )
+    if include_video and args.video_stream >= count_streams(probe, "video"):
+        raise SystemExit(
+            f"--video-stream {args.video_stream} was requested but the input has "
+            f"{count_streams(probe, 'video')} video track(s)."
+        )
+
     raw_intervals = transcribe(args, transcriber)
+    padding, merge_gap, min_duration = detector_padding(args)
     intervals = merge_intervals(
         raw_intervals,
         duration=duration,
-        padding=args.padding,
-        merge_gap=args.merge_gap,
-        min_duration=args.min_duration,
+        padding=padding,
+        merge_gap=merge_gap,
+        min_duration=min_duration,
     )
 
     if not intervals:
@@ -480,6 +834,13 @@ def trim_file(args: argparse.Namespace, transcriber: WhisperTranscriber) -> bool
         return False
 
     print_ranges(intervals)
+    if args.list_dir is not None:
+        relative = args.input
+        if getattr(args, "source_root", None) is not None:
+            relative = args.input.relative_to(args.source_root)
+        concat_path, csv_path = write_cut_list(args.list_dir, args.input, relative, intervals)
+        print(f"Cut list: {concat_path}")
+        print(f"Timecodes: {csv_path}")
     if args.dry_run:
         return True
 
@@ -525,7 +886,7 @@ def find_media_files(folder: Path, output_folder: Path | None = None) -> list[Pa
     return files
 
 
-def process_folder(args: argparse.Namespace, transcriber: WhisperTranscriber) -> int:
+def process_folder(args: argparse.Namespace, transcriber=None) -> int:
     files = find_media_files(args.input, args.output)
     print(f"Found {len(files)} source media file(s) in {args.input}")
     completed = skipped = failed = 0
@@ -545,6 +906,7 @@ def process_folder(args: argparse.Namespace, transcriber: WhisperTranscriber) ->
         file_args = argparse.Namespace(**vars(args))
         file_args.input = input_path
         file_args.output = output_path
+        file_args.source_root = args.input
         try:
             if trim_file(file_args, transcriber):
                 completed += 1
@@ -559,14 +921,29 @@ def process_folder(args: argparse.Namespace, transcriber: WhisperTranscriber) ->
 
 
 def main() -> int:
+    # Source names are often non-ASCII; never die because the console code page
+    # cannot represent one.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
     args = parse_args()
     args.input = args.input.expanduser().resolve()
     if args.output is not None:
         args.output = args.output.expanduser().resolve()
+    if args.list_dir is not None:
+        args.list_dir = args.list_dir.expanduser().resolve()
+    args.source_root = None
     if not args.input.exists():
         raise SystemExit(f"Input path does not exist: {args.input}")
     if args.padding < 0 or args.merge_gap < 0 or args.min_duration < 0:
         raise SystemExit("--padding, --merge-gap, and --min-duration must be non-negative.")
+    if not 0 < args.vad_threshold < 1:
+        raise SystemExit("--vad-threshold must be between 0 and 1.")
+    if min(args.vad_pad_ms, args.vad_min_speech_ms, args.vad_min_silence_ms) < 0:
+        raise SystemExit("The --vad-* millisecond options must be non-negative.")
+    if min(args.audio_stream, args.video_stream) < 0:
+        raise SystemExit("--audio-stream and --video-stream must be non-negative.")
 
     if args.input.is_dir():
         if args.output is not None and args.output.exists() and not args.output.is_dir():
@@ -583,10 +960,10 @@ def main() -> int:
 
     require_tool("ffmpeg")
     require_tool("ffprobe")
-    transcriber = WhisperTranscriber()
+    detector = build_detector(args)
     if args.input.is_dir():
-        return process_folder(args, transcriber)
-    return 0 if trim_file(args, transcriber) else 1
+        return process_folder(args, detector)
+    return 0 if trim_file(args, detector) else 1
 
 
 if __name__ == "__main__":

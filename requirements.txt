@@ -1,1 +1,6 @@
 faster-whisper>=1.1.0
+# faster-whisper 1.2.1 still calls av.open(metadata_errors=...), which PyAV 19
+# removed. Keep PyAV below 19 until faster-whisper catches up.
+av>=11,<19
+silero-vad>=5.1
+numpy>=1.24

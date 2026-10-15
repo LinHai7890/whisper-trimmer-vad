@@ -25,12 +25,11 @@ Thumbs.db
 /Whisper Trimmer old.zip
 
 # Local test artifacts and generated media
-tests/
-/test_whisper_trim.py
 .trim_test/
 trimmed/
 *_trimmed.*
 *.ffmpeg
+.coverage
 
 # Locally cached Whisper models
 *.bin
