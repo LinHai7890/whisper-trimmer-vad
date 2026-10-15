@@ -40,11 +40,15 @@
     两遍编码。实测偏差在 3% 以内，耗时约为单遍的两倍。
 
 .PARAMETER Bitrate
-    目标视频码率，如 1500k。配合 -RateControl vbr 使用。
+    目标视频码率，如 1500k，默认 1500k。配合 -RateControl vbr 和 2pass 使用。
 
 .PARAMETER RateControl
-    码率控制方式。cq 恒定质量（体积不可控），vbr 单遍目标码率，
-    2pass 两遍编码（体积最准，耗时约 1.8 倍）。
+    码率控制方式，默认 2pass。两遍编码实测体积偏差在 3% 以内，耗时约为单遍的两倍。
+    改成 cq 则改为恒定质量，体积不可控。
+
+.PARAMETER VadPadMs
+    每段人声前后各多留多少毫秒，默认 400。调大会让切点更有余量，但相邻区间
+    会互相重叠后合并，段数变少、输出变长。
 
 .EXAMPLE
     .\重编码整季.ps1 "D:\剧集"
@@ -73,13 +77,13 @@ param(
     [string]$Preset = 'medium',
 
     [ValidateSet('cq', 'vbr', '2pass')]
-    [string]$RateControl = 'cq',
-    [string]$Bitrate,
+    [string]$RateControl = '2pass',
+    [string]$Bitrate = '1500k',
     [string]$TargetSize,
 
     [ValidateRange(0.01, 0.99)]
     [double]$VadThreshold = 0.5,
-    [int]$VadPadMs = 200,
+    [int]$VadPadMs = 400,
     [int]$VadMinSilenceMs = 350,
     [int]$VadMinSpeechMs = 250,
 
@@ -160,8 +164,9 @@ if ($OutputDir) { Write-Ok "输出        $((New-Item -ItemType Directory -Force
 if ($ListDir) { Write-Ok "剪辑表      $((New-Item -ItemType Directory -Force -Path $ListDir).FullName)" }
 Write-Ok "编码方式    $Encoder  (cq=$Cq crf=$Crf preset=$Preset)"
 $rateDescription = "码率控制    $RateControl"
-if ($TargetSize) { $rateDescription += "  目标体积 $TargetSize（自动换算码率，两遍）" }
-elseif ($Bitrate) { $rateDescription += "  目标码率 $Bitrate" }
+if ($Encoder -eq 'copy') { $rateDescription += '  (无损复制，不做码率控制)' }
+elseif ($TargetSize) { $rateDescription += "  目标体积 $TargetSize（按保留时长反算码率）" }
+elseif ($Bitrate -and $RateControl -ne 'cq') { $rateDescription += "  目标码率 $Bitrate" }
 Write-Ok $rateDescription
 Write-Ok "检测参数    阈值=$VadThreshold 补边=${VadPadMs}ms 合并=${VadMinSilenceMs}ms 最短=${VadMinSpeechMs}ms"
 if ($DryRun) { Write-Warn '试运行模式：不会生成任何成品。' }
@@ -241,11 +246,11 @@ foreach ($file in $runnable) {
     )
     if ($TargetSize) {
         $arguments += @('--target-size', $TargetSize)
-        if ($RateControl -ne 'cq') { $arguments += @('--rate-control', $RateControl) }
     }
-    else {
+    elseif ($Encoder -ne 'copy') {
         $arguments += @('--rate-control', $RateControl)
-        if ($Bitrate) { $arguments += @('--bitrate', $Bitrate) }
+        # Constant quality ignores a bitrate, so only offer one that is used.
+        if ($Bitrate -and $RateControl -ne 'cq') { $arguments += @('--bitrate', $Bitrate) }
     }
     if ($resolvedListDir) { $arguments += @('--list-dir', $resolvedListDir) }
     if ($Overwrite) { $arguments += '--overwrite' }
