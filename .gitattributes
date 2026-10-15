@@ -1,0 +1,4 @@
+# PowerShell reads .ps1 as UTF-8 only when a byte order mark is present, and
+# expects CRLF. Pin both so autocrlf cannot turn the Chinese comments in
+# 重编码整季.ps1 into a syntax error on checkout.
+*.ps1 text eol=crlf
