@@ -124,6 +124,14 @@ class TestEncoders:
         assert resolve_encoder("x264") == "libx264"
         assert resolve_encoder("qsv") == "h264_qsv"
 
+    def test_copy_is_not_probed_as_an_encoder(self, monkeypatch):
+        monkeypatch.setattr(whisper_trim, "_available_encoders", set())
+        assert resolve_encoder("copy") == "copy"
+
+    def test_auto_never_picks_stream_copy(self, monkeypatch):
+        monkeypatch.setattr(whisper_trim, "_available_encoders", {"libx264", "h264_nvenc"})
+        assert resolve_encoder("auto") == "h264_nvenc"
+
     def test_nvenc_uses_constant_quality(self):
         args = argparse.Namespace(crf=18, cq=19, preset="medium")
         flags = video_encoder_args("h264_nvenc", args)
@@ -142,19 +150,28 @@ class TestCutList:
         assert timecode(0) == "00:00:00.000"
         assert timecode(3661.5) == "01:01:01.500"
 
-    def test_windows_drive_letter_is_escaped(self):
-        escaped = ffconcat_escape(Path(r"D:\AI WORKSPACE\clip.mkv"))
-        assert escaped == r"D\:/AI WORKSPACE/clip.mkv"
+    def test_windows_path_uses_forward_slashes(self):
+        assert ffconcat_escape(Path(r"D:\AI WORKSPACE\clip.mkv")) == "D:/AI WORKSPACE/clip.mkv"
 
     def test_single_quote_is_escaped(self):
         assert ffconcat_escape(Path("/tmp/it's.mkv")) == r"/tmp/it'\''s.mkv"
 
+    def test_relative_path_is_required(self, tmp_path):
+        """An absolute 'relative' path would make the join drop list_dir."""
+        source = tmp_path / "media" / "ep10.mkv"
+        source.parent.mkdir()
+        source.write_bytes(b"")
+        concat_path, _ = write_cut_list(
+            tmp_path / "lists", source, Path("ep10.mkv"), [(1.0, 2.0)]
+        )
+        assert concat_path.parent == tmp_path / "lists"
+
     def test_writes_ffconcat_and_csv(self, tmp_path):
         concat_path, csv_path = write_cut_list(
-            tmp_path / "lists", Path("/media/ep10.mkv"), Path("s1/ep10.mkv"), [(1.0, 2.5), (10.0, 12.0)]
+            tmp_dir := tmp_path / "lists", Path("/media/ep10.mkv"), Path("s1/ep10.mkv"), [(1.0, 2.5), (10.0, 12.0)]
         )
-        assert concat_path == tmp_path / "lists" / "s1" / "ep10.ffconcat"
-        assert csv_path == tmp_path / "lists" / "s1" / "ep10.csv"
+        assert concat_path == tmp_dir / "s1" / "ep10.ffconcat"
+        assert csv_path == tmp_dir / "s1" / "ep10.csv"
 
         concat = concat_path.read_text(encoding="utf-8").splitlines()
         assert concat[0] == "ffconcat version 1.0"
@@ -163,6 +180,43 @@ class TestCutList:
         rows = csv_path.read_text(encoding="utf-8").splitlines()
         assert rows[0].startswith("index,start_seconds")
         assert rows[1] == "1,1.000,2.500,1.500,00:00:01.000,00:00:02.500"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
+def test_ffconcat_cut_list_is_playable(tmp_path):
+    """The cut list has to survive a real concat run, paths and all."""
+    source = tmp_path / "a b's clip.wav"
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+            str(source),
+        ],
+        check=True,
+    )
+    concat_path, _ = write_cut_list(tmp_path / "lists", source, Path(source.name), [(1.0, 3.0)])
+    assert concat_path.exists()
+
+    rendered = tmp_path / "rendered.wav"
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(concat_path),
+            "-c", "copy", str(rendered),
+        ],
+        check=True,
+    )
+    assert rendered.stat().st_size > 0
+    assert 1.5 < duration_of(rendered) < 2.5
+
+
+def duration_of(path: Path) -> float:
+    completed = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    return float(completed.stdout.decode("utf-8", errors="replace").strip())
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")

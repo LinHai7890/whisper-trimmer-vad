@@ -31,6 +31,7 @@ VAD_SAMPLE_RATE = 16000
 ENCODER_PREFERENCE = ("h264_nvenc", "hevc_nvenc", "h264_qsv", "h264_vaapi", "libx264")
 ENCODER_CHOICES = (
     "auto",
+    "copy",
     "libx264",
     "libx265",
     "h264_nvenc",
@@ -197,9 +198,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--encoder",
         default="auto",
-        help="Video encoder for the output. auto picks a hardware encoder when "
-        "FFmpeg has one, and falls back to libx264. Otherwise use one of: "
-        + ", ".join(ENCODER_CHOICES),
+        help="How the output is produced. auto picks a hardware video encoder "
+        "when FFmpeg has one and falls back to libx264. copy cuts without "
+        "re-encoding, which is much faster but snaps cuts to key frames. "
+        "Otherwise use one of: " + ", ".join(ENCODER_CHOICES),
     )
     parser.add_argument(
         "--crf",
@@ -569,14 +571,21 @@ def timecode(seconds: float) -> str:
 
 
 def ffconcat_escape(path: Path) -> str:
-    """Escape a path for the FFmpeg concat demuxer, including Windows drives."""
-    # Normalise separators first, otherwise the backslash that protects the
-    # drive colon would be turned into a slash again.
-    text = str(path).replace("\\", "/")
-    text = text.replace("'", r"'\''")
-    if len(text) > 1 and text[1] == ":":
-        text = text[:2].replace(":", r"\:") + text[2:]
-    return text
+    """Escape a path for the FFmpeg concat demuxer.
+
+    Current FFmpeg reads a Windows path with forward slashes straight from the
+    quoted file line, so only the separator and a single quote need handling.
+    """
+    return str(path).replace("\\", "/").replace("'", r"'\''")
+
+
+def build_ffconcat(input_path: Path, intervals: list[tuple[float, float]]) -> str:
+    lines = ["ffconcat version 1.0"]
+    for start, end in intervals:
+        lines.append(f"file '{ffconcat_escape(input_path)}'")
+        lines.append(f"inpoint {start:.6f}")
+        lines.append(f"outpoint {end:.6f}")
+    return "\n".join(lines) + "\n"
 
 
 def write_cut_list(
@@ -591,12 +600,7 @@ def write_cut_list(
     csv_path = destination.with_suffix(".csv")
     concat_path.parent.mkdir(parents=True, exist_ok=True)
 
-    lines = ["ffconcat version 1.0"]
-    for start, end in intervals:
-        lines.append(f"file '{ffconcat_escape(input_path)}'")
-        lines.append(f"inpoint {start:.6f}")
-        lines.append(f"outpoint {end:.6f}")
-    concat_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    concat_path.write_text(build_ffconcat(input_path, intervals), encoding="utf-8")
 
     rows = ["index,start_seconds,end_seconds,duration_seconds,start_timecode,end_timecode"]
     for index, (start, end) in enumerate(intervals, 1):
@@ -684,6 +688,9 @@ def resolve_encoder(requested: str) -> str:
         name = ENCODER_ALIASES.get(requested, requested)
         if name not in ENCODER_CHOICES or name == "auto":
             raise SystemExit(f"Unknown encoder '{requested}'. Choose one of: {', '.join(ENCODER_CHOICES)}")
+        if name == "copy":
+            # Stream copy is a concat demuxer mode, not an FFmpeg encoder.
+            return name
         if name not in available_encoders():
             raise SystemExit(
                 f"This FFmpeg build has no '{name}' encoder. "
@@ -735,6 +742,42 @@ def video_encoder_args(encoder: str, args: argparse.Namespace) -> list[str]:
     ]
 
 
+def render_copy(
+    input_path: Path,
+    output_path: Path,
+    intervals: list[tuple[float, float]],
+) -> None:
+    """Cut without re-encoding, by handing the ranges to the concat demuxer.
+
+    Far faster than re-encoding and lossless, but every range snaps to a key
+    frame, so cut points land up to one GOP early and the audio and video
+    together are not frame accurate.
+    """
+    with tempfile.TemporaryDirectory() as workspace:
+        list_path = Path(workspace) / "cut.ffconcat"
+        list_path.write_text(build_ffconcat(input_path, intervals), encoding="utf-8")
+        print("Rendering trimmed file with FFmpeg (stream copy)...")
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_path),
+                "-c",
+                "copy",
+                str(output_path),
+            ],
+            check=True,
+        )
+
+
 def render_output(
     input_path: Path,
     output_path: Path,
@@ -745,6 +788,16 @@ def render_output(
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    encoder = resolve_encoder(getattr(args, "encoder", "auto"))
+    if encoder == "copy" and include_video:
+        render_copy(input_path, output_path, intervals)
+        return
+    if encoder == "copy":
+        # Stream copy cannot transcode, and an audio-only output still needs the
+        # speech ranges applied as filters.
+        print("Audio-only output cannot be stream copied; re-encoding instead.")
+        encoder = resolve_encoder("auto")
+
     video_stream = getattr(args, "video_stream", 0)
     audio_stream = getattr(args, "audio_stream", 0)
     with tempfile.NamedTemporaryFile("w", suffix=".ffmpeg", delete=False) as filter_file:
@@ -754,8 +807,6 @@ def render_output(
             )
         )
         filter_path = Path(filter_file.name)
-
-    encoder = resolve_encoder(getattr(args, "encoder", "auto")) if include_video else None
 
     try:
         command = [
@@ -835,9 +886,13 @@ def trim_file(args: argparse.Namespace, transcriber=None) -> bool:
 
     print_ranges(intervals)
     if args.list_dir is not None:
-        relative = args.input
-        if getattr(args, "source_root", None) is not None:
-            relative = args.input.relative_to(args.source_root)
+        source_root = getattr(args, "source_root", None)
+        if source_root is not None:
+            relative = args.input.relative_to(source_root)
+        else:
+            # Single-file mode has no folder to mirror, and an absolute path
+            # would make the join discard list_dir entirely.
+            relative = Path(args.input.name)
         concat_path, csv_path = write_cut_list(args.list_dir, args.input, relative, intervals)
         print(f"Cut list: {concat_path}")
         print(f"Timecodes: {csv_path}")
