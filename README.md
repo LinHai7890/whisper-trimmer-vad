@@ -1,5 +1,15 @@
 # Whisper Trimmer
 
+> **This is a fork of [Hypercub3/Whisper-Trimmer](https://github.com/Hypercub3/Whisper-Trimmer).**
+> It is not affiliated with or endorsed by the original author. The MIT licence and
+> the original copyright notice are kept intact. Thanks to Phillip Fierro for the
+> original work.
+>
+> The changes in this fork were written with AI assistance. The commit history has
+> not been rewritten, so the commits show up as authored by an unlinked identity.
+> Every claim about timing and output size in these docs was measured on a real
+> render, and the commands shown were run as written.
+
 Trim an audio or video file, or a whole folder and its subfolders, down to the parts
 that contain speech.
 
@@ -15,6 +25,32 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\重编码整季.ps1" "D:\
 Defaults are tuned for dialogue: two pass encoding at 1500k with 400ms of padding
 around each range, which turns a 45 minute episode into roughly 29 minutes at about
 50 MB.
+
+## What this fork changes
+
+- **Voice activity detection instead of speech recognition.** Silero VAD is now the
+  default detector. A recognizer misses shouting, singing and overlapping dialogue,
+  and hallucinates words over music, which then get kept as speech. VAD does neither,
+  and it runs fully offline because the model ships inside the `silero-vad` wheel.
+  Whisper is still available with `--detector whisper`.
+- **Hardware encoding.** `--encoder auto` probes FFmpeg and uses a GPU encoder when
+  one exists, instead of being pinned to libx264.
+- **Lossless stream copying.** `--encoder copy` grows each range to whole key frames
+  first, so the cut is actually decodable, and prints how much silence that costs.
+- **One pass rendering.** Ranges are applied with `select` and `aselect` rather than
+  one trim branch per range, which was superlinear. A 45 minute episode went from
+  574s to 127s.
+- **Two pass encoding for a target size.** `--target-size 700M` works out the
+  bitrate from the audio that is actually kept.
+- **Cut lists.** `--list-dir` writes an `.ffconcat` plus a CSV of the original
+  timecodes, since the output timeline is condensed and no longer matches the source.
+- **Fixed non-ASCII paths.** FFprobe and FFmpeg output was decoded with the console
+  code page, which raised `UnicodeDecodeError` on Chinese file names.
+- **Chinese documentation and a one-click batch script.**
+
+The legacy `.bat` launchers and `whisper_trim_all*.py` are the original author's and
+are superseded by `whisper_trim.py`. They still work but are slower and have none of
+the fixes above.
 
 Two detectors are available:
 
