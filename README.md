@@ -5,6 +5,12 @@ that contain speech.
 
 中文教程见 [使用教程.md](使用教程.md)，包含整季批量、参数调优、编码方式选择和常见问题。
 
+一键批量重编码：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\重编码整季.ps1" "D:\Media" -ListDir "D:\Cut Lists"
+```
+
 Two detectors are available:
 
 | Detector | Default | What it uses | Best for |
