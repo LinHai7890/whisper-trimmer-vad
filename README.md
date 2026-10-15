@@ -4,6 +4,7 @@ Trim an audio or video file, or a whole folder and its subfolders, down to the p
 that contain speech.
 
 中文教程见 [使用教程.md](使用教程.md)，包含整季批量、参数调优、编码方式选择和常见问题。
+要改码率控制模式或码率，见 [码率与模式设置.md](码率与模式设置.md)，那里写清了每个参数对应哪个文件的哪一行。
 
 一键批量重编码：
 
@@ -185,7 +186,8 @@ python whisper_trim.py "D:\Media" --encoder auto
   and `x265` also work.
 - `--rate-control`: `cq` (default), `vbr` or `2pass`. Constant quality leaves the
   size wherever it lands; `vbr` spends an average bitrate over one pass; `2pass`
-  does the same over two and lands closest to the target.
+  does the same over two and lands closest to the target. Only `2pass` has been
+  measured here, at within 3 per cent of the requested size.
 - `--bitrate`: target video bitrate, such as `1500k`. Required by `vbr` and `2pass`.
 - `--target-size`: target output size, such as `700M`. The bitrate is worked out
   from the audio that is actually kept, and selects `2pass` unless told otherwise.
