@@ -3,6 +3,8 @@
 Trim an audio or video file, or a whole folder and its subfolders, down to the parts
 that contain speech.
 
+中文教程见 [使用教程.md](使用教程.md)，包含整季批量、参数调优、编码方式选择和常见问题。
+
 Two detectors are available:
 
 | Detector | Default | What it uses | Best for |

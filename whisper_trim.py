@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Iterable
 
@@ -84,7 +85,7 @@ MEDIA_EXTENSIONS = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Use Whisper speech timestamps to remove non-speech parts of audio/video."
+        description="Keep only the parts of audio or video that contain speech."
     )
     parser.add_argument("input", type=Path, help="Input media file or folder (scanned recursively)")
     parser.add_argument(
@@ -210,8 +211,9 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="How the output is produced. auto picks a hardware video encoder "
         "when FFmpeg has one and falls back to libx264. copy cuts without "
-        "re-encoding, which is much faster but snaps cuts to key frames. "
-        "Otherwise use one of: " + ", ".join(ENCODER_CHOICES),
+        "re-encoding, which is much faster, but has to grow every range out to "
+        "a key frame and so keeps the silence around each cut. Otherwise use "
+        "one of: " + ", ".join(ENCODER_CHOICES),
     )
     parser.add_argument(
         "--crf",
@@ -383,7 +385,11 @@ class SileroVadDetector:
             from silero_vad import load_silero_vad
 
             self.torch = torch
-            self.model = load_silero_vad()
+            with warnings.catch_warnings():
+                # Silero still loads its model through torch.jit, which warns
+                # on every run and is not something a user can act on.
+                warnings.filterwarnings("ignore", category=FutureWarning)
+                self.model = load_silero_vad()
         except Exception as exc:
             self.load_error = (
                 f"Could not load Silero VAD: {exc}. "
